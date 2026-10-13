@@ -1,0 +1,21 @@
+# Environment / secrets
+.env
+
+# Telegram session files
+*.session
+
+# Generated thumbnails
+temp_thumbs/
+
+# Logs
+logs/*.log
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# OS
+Thumbs.db
+.DS_Store

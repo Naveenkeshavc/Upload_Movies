@@ -1,0 +1,1286 @@
+import os
+import json
+import time
+import asyncio
+import logging
+import threading
+import tempfile
+from pathlib import Path
+
+import tkinter as tk
+
+from tkinter import (
+    ttk,
+    filedialog,
+    messagebox
+)
+
+from tkinterdnd2 import (
+    DND_FILES,
+    TkinterDnD
+)
+
+from PIL import Image
+
+from dotenv import load_dotenv
+
+from pyrogram import Client
+from pyrogram.errors import (
+    FloodWait
+)
+
+# =====================================================
+# OPTIONAL WINLOOP
+# =====================================================
+
+try:
+    import winloop
+
+    asyncio.set_event_loop_policy(
+        winloop.EventLoopPolicy()
+    )
+
+except ImportError:
+    pass
+
+# =====================================================
+# APP PATHS
+# =====================================================
+
+BASE_DIR = Path(__file__).parent
+
+LOG_DIR = BASE_DIR / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+
+TEMP_DIR = BASE_DIR / "temp_thumbs"
+TEMP_DIR.mkdir(exist_ok=True)
+
+# =====================================================
+# LOAD ENVIRONMENT
+# =====================================================
+
+load_dotenv()
+
+API_ID = os.getenv("TG_API_ID")
+API_HASH = os.getenv("TG_API_HASH")
+
+if not API_ID:
+    raise RuntimeError(
+        "TG_API_ID missing from .env"
+    )
+
+if not API_HASH:
+    raise RuntimeError(
+        "TG_API_HASH missing from .env"
+    )
+
+API_ID = int(API_ID)
+
+# =====================================================
+# LOAD CONFIG.JSON
+# =====================================================
+
+CONFIG_PATH = BASE_DIR / "config.json"
+
+if not CONFIG_PATH.exists():
+    raise FileNotFoundError(
+        "config.json not found"
+    )
+
+with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    CONFIG = json.load(f)
+
+CHAT_ID = CONFIG["chat_id"]
+
+CLIENT_WORKERS = CONFIG.get(
+    "client_workers",
+    8
+)
+
+UPLOAD_CONCURRENCY = CONFIG.get(
+    "upload_concurrency",
+    3
+)
+
+THUMB_MAX_SIZE_KB = CONFIG.get(
+    "thumbnail_max_size_kb",
+    200
+)
+
+THUMB_MAX_DIMENSION = CONFIG.get(
+    "thumbnail_max_dimension",
+    320
+)
+
+RETRY_COUNT = CONFIG.get(
+    "retry_count",
+    3
+)
+
+# =====================================================
+# LOGGING
+# =====================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format=(
+        "%(asctime)s | "
+        "%(levelname)s | "
+        "%(message)s"
+    ),
+    handlers=[
+        logging.FileHandler(
+            LOG_DIR / "uploader.log",
+            encoding="utf-8"
+        ),
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger(
+    "TelegramUploader"
+)
+
+logger.info(
+    "Application started."
+)
+
+class UploadItem:
+
+    def __init__(
+        self,
+        file_path,
+        caption="",
+        thumb_path=None
+    ):
+
+        self.file_path = file_path
+
+        self.caption = caption
+
+        self.thumb_path = thumb_path
+
+    @property
+    def filename(self):
+
+        return os.path.basename(
+            self.file_path
+        )
+
+    def exists(self):
+
+        return os.path.exists(
+            self.file_path
+        )
+    
+# =====================================================
+# GLOBAL STATE
+# =====================================================
+
+upload_queue = []
+
+selected_file = None
+
+selected_thumbnail = None
+
+upload_running = False
+
+current_thread = None
+
+PHOTO_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".bmp",
+    ".webp"
+}
+
+VIDEO_EXTENSIONS = {
+    ".mp4",
+    ".mkv",
+    ".avi",
+    ".mov",
+    ".wmv",
+    ".flv"
+}
+
+# =====================================================
+# THUMBNAIL TRACKING
+# =====================================================
+
+generated_thumbnails = set()
+
+
+# =====================================================
+# HELPERS
+# =====================================================
+
+def is_upload_running():
+
+    return upload_running
+
+
+def validate_file_exists(path):
+
+    if not path:
+        return False
+
+    return os.path.isfile(path)
+
+
+def lock_queue_controls():
+
+    try:
+        add_button.config(state="disabled")
+        remove_button.config(state="disabled")
+        upload_button.config(state="disabled")
+        choose_file_button.config(state="disabled")
+        choose_thumb_button.config(state="disabled")
+
+    except Exception as e:
+        logger.error(
+            f"Failed locking controls: {e}"
+        )
+
+
+def unlock_queue_controls():
+
+    try:
+        add_button.config(state="normal")
+        remove_button.config(state="normal")
+        upload_button.config(state="normal")
+        choose_file_button.config(state="normal")
+        choose_thumb_button.config(state="normal")
+
+    except Exception as e:
+        logger.error(
+            f"Failed unlocking controls: {e}"
+        )
+
+
+# =====================================================
+# TEMP THUMB CLEANUP
+# =====================================================
+
+def cleanup_temp_thumbnail(path):
+
+    if not path:
+        return
+
+    try:
+
+        if os.path.exists(path):
+
+            os.remove(path)
+
+            logger.info(
+                f"Deleted temp thumbnail: {path}"
+            )
+
+    except Exception as e:
+
+        logger.error(
+            f"Thumbnail cleanup failed: {e}"
+        )
+
+
+def cleanup_all_temp_thumbnails():
+
+    for thumb in list(generated_thumbnails):
+
+        cleanup_temp_thumbnail(thumb)
+
+    generated_thumbnails.clear()
+
+
+# =====================================================
+# FILE PICKER
+# =====================================================
+
+def choose_file():
+
+    global selected_file
+
+    if is_upload_running():
+
+        messagebox.showwarning(
+            "Upload Running",
+            "Cannot modify queue while uploading."
+        )
+
+        return
+
+    result = filedialog.askopenfilename(
+        title="Select File"
+    )
+
+    if not result:
+        return
+
+    selected_file = result
+
+    file_label.config(
+        text=f"File: {os.path.basename(result)}"
+    )
+
+    logger.info(
+        f"Selected file: {result}"
+    )
+
+
+# =====================================================
+# THUMBNAIL GENERATION
+# =====================================================
+
+def generate_thumbnail(source_path):
+
+    try:
+
+        image = Image.open(
+            source_path
+        ).convert("RGB")
+
+        image.thumbnail(
+            (
+                THUMB_MAX_DIMENSION,
+                THUMB_MAX_DIMENSION
+            )
+        )
+
+        temp_file = tempfile.NamedTemporaryFile(
+            suffix=".jpg",
+            delete=False,
+            dir=TEMP_DIR
+        )
+
+        temp_file.close()
+
+        quality = 80
+
+        while quality >= 30:
+
+            image.save(
+                temp_file.name,
+                format="JPEG",
+                quality=quality,
+                optimize=True
+            )
+
+            size_kb = (
+                os.path.getsize(
+                    temp_file.name
+                ) / 1024
+            )
+
+            if size_kb <= THUMB_MAX_SIZE_KB:
+                break
+
+            quality -= 5
+
+        generated_thumbnails.add(
+            temp_file.name
+        )
+
+        logger.info(
+            f"Generated thumbnail: "
+            f"{temp_file.name}"
+        )
+
+        return temp_file.name
+
+    except Exception as e:
+
+        logger.exception(
+            "Thumbnail generation failed"
+        )
+
+        raise e
+
+
+# =====================================================
+# THUMB PICKER
+# =====================================================
+
+def choose_thumbnail():
+
+    global selected_thumbnail
+
+    if is_upload_running():
+
+        messagebox.showwarning(
+            "Upload Running",
+            "Cannot modify queue while uploading."
+        )
+
+        return
+
+    result = filedialog.askopenfilename(
+        title="Select Thumbnail",
+        filetypes=[
+            (
+                "Images",
+                "*.jpg *.jpeg *.png *.bmp *.webp"
+            )
+        ]
+    )
+
+    if not result:
+        return
+
+    try:
+
+        thumb_path = generate_thumbnail(
+            result
+        )
+
+        selected_thumbnail = thumb_path
+
+        thumb_label.config(
+            text=(
+                f"Thumbnail: "
+                f"{os.path.basename(thumb_path)}"
+            )
+        )
+
+    except Exception as e:
+
+        messagebox.showerror(
+            "Thumbnail Error",
+            str(e)
+        )
+
+
+# =====================================================
+# QUEUE MANAGEMENT
+# =====================================================
+
+def add_to_queue():
+
+    global selected_file
+    global selected_thumbnail
+
+    if is_upload_running():
+
+        messagebox.showwarning(
+            "Upload Running",
+            "Queue cannot be modified."
+        )
+
+        return
+
+    if not selected_file:
+
+        messagebox.showerror(
+            "Missing File",
+            "Please select a file."
+        )
+
+        return
+
+    if not validate_file_exists(
+        selected_file
+    ):
+
+        messagebox.showerror(
+            "File Missing",
+            "Selected file no longer exists."
+        )
+
+        return
+
+    caption = (
+        caption_entry.get()
+        .strip()
+    )
+
+    item = UploadItem(
+        file_path=selected_file,
+        caption=caption,
+        thumb_path=selected_thumbnail
+    )
+
+    upload_queue.append(item)
+
+    display_caption = (
+        caption
+        if caption
+        else "(no caption)"
+    )
+
+    listbox.insert(
+        tk.END,
+        f"{item.filename} → "
+        f"{display_caption}"
+    )
+
+    logger.info(
+        f"Added to queue: {item.filename}"
+    )
+
+    selected_file = None
+    selected_thumbnail = None
+
+    caption_entry.delete(
+        0,
+        tk.END
+    )
+
+    file_label.config(
+        text="File: None"
+    )
+
+    thumb_label.config(
+        text="Thumbnail: None"
+    )
+
+
+# =====================================================
+# REMOVE SELECTED
+# =====================================================
+
+def remove_selected():
+
+    if is_upload_running():
+
+        messagebox.showwarning(
+            "Upload Running",
+            "Cannot modify queue."
+        )
+
+        return
+
+    selection = (
+        listbox.curselection()
+    )
+
+    if not selection:
+        return
+
+    idx = selection[0]
+
+    try:
+
+        item = upload_queue[idx]
+
+        if item.thumb_path:
+
+            cleanup_temp_thumbnail(
+                item.thumb_path
+            )
+
+        del upload_queue[idx]
+
+        listbox.delete(idx)
+
+        logger.info(
+            f"Removed item: "
+            f"{item.filename}"
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Remove failed"
+        )
+
+        messagebox.showerror(
+            "Error",
+            str(e)
+        )
+
+
+# =====================================================
+# DRAG & DROP
+# =====================================================
+
+def drop_file(event):
+
+    global selected_file
+
+    if is_upload_running():
+
+        return
+
+    try:
+
+        files = root.tk.splitlist(
+            event.data
+        )
+
+        if not files:
+            return
+
+        dropped_file = files[0]
+
+        if not validate_file_exists(
+            dropped_file
+        ):
+            return
+
+        selected_file = dropped_file
+
+        file_label.config(
+            text=(
+                f"File: "
+                f"{os.path.basename(dropped_file)}"
+            )
+        )
+
+        logger.info(
+            f"Dropped file: "
+            f"{dropped_file}"
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Drag-drop failed"
+        )
+
+
+# =====================================================
+# APP EXIT CLEANUP
+# =====================================================
+
+def on_app_close():
+
+    if upload_running:
+
+        messagebox.showwarning(
+            "Upload Running",
+            (
+                "Please wait until uploads "
+                "have finished."
+            )
+        )
+
+        return
+
+    try:
+
+        cleanup_all_temp_thumbnails()
+
+    finally:
+
+        root.destroy()
+
+# =====================================================
+# UPLOAD STATE
+# =====================================================
+
+progress_window = None
+progress_bars = []
+progress_labels = []
+percent_labels = []
+speed_labels = []
+
+
+# =====================================================
+# PROGRESS WINDOW CREATION
+# =====================================================
+
+def create_progress_window():
+
+    global progress_window
+    global progress_bars
+    global progress_labels
+    global percent_labels
+    global speed_labels
+
+    progress_window = tk.Toplevel(root)
+    progress_window.title("Uploading...")
+    progress_window.geometry("600x600")
+
+    progress_window.protocol("WM_DELETE_WINDOW", lambda: None)
+
+    # =====================================================
+    # SCROLLABLE CANVAS SETUP
+    # =====================================================
+
+    container = tk.Frame(progress_window)
+    container.pack(fill="both", expand=True)
+
+    canvas = tk.Canvas(container)
+    scrollbar = tk.Scrollbar(container, orient="vertical", command=canvas.yview)
+
+    scroll_frame = tk.Frame(canvas)
+
+    scroll_frame.bind(
+        "<Configure>",
+        lambda e: canvas.configure(
+            scrollregion=canvas.bbox("all")
+        )
+    )
+
+    canvas.create_window(
+        (0, 0),
+        window=scroll_frame,
+        anchor="nw"
+    )
+
+    canvas.configure(yscrollcommand=scrollbar.set)
+
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+
+    # Optional: mouse wheel scrolling
+    def _on_mousewheel(event):
+        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+    # =====================================================
+    # RESET UI LISTS
+    # =====================================================
+
+    progress_bars.clear()
+    progress_labels.clear()
+    percent_labels.clear()
+    speed_labels.clear()
+
+    # =====================================================
+    # CREATE PROGRESS ITEMS INSIDE SCROLL FRAME
+    # =====================================================
+
+    for item in upload_queue:
+
+        frame = tk.Frame(scroll_frame)
+        frame.pack(fill="x", pady=6, padx=5)
+
+        label = tk.Label(
+            frame,
+            text=f"Waiting: {item.filename}",
+            anchor="w"
+        )
+        label.pack(fill="x")
+
+        bar = ttk.Progressbar(
+            frame,
+            length=450,
+            mode="determinate"
+        )
+        bar.pack(pady=2)
+
+        info = tk.Frame(frame)
+        info.pack(fill="x")
+
+        percent = tk.Label(info, text="0%")
+        percent.pack(side="left", padx=10)
+
+        speed = tk.Label(info, text="0 MB/s")
+        speed.pack(side="right", padx=10)
+
+        progress_labels.append(label)
+        progress_bars.append(bar)
+        percent_labels.append(percent)
+        speed_labels.append(speed)
+
+# =====================================================
+# UI SAFE UPDATE
+# =====================================================
+
+def ui_update(fn):
+
+    try:
+
+        root.after(0, fn)
+
+    except Exception as e:
+
+        logger.error(f"UI update failed: {e}")
+
+
+# =====================================================
+# MAIN UPLOAD ENGINE (CONCURRENT)
+# =====================================================
+
+async def upload_one(app, chat_id, idx, item):
+
+    file_path = item.file_path
+    caption = item.caption
+    thumb = item.thumb_path
+
+    ext = os.path.splitext(file_path)[1].lower()
+
+    retries = RETRY_COUNT
+    success = False
+
+    last_time = time.time()
+    last_bytes = 0
+
+    def progress(current, total):
+
+        nonlocal last_time, last_bytes
+
+        now = time.time()
+
+        if current < total:
+            if now - last_time < 0.2:
+                return
+
+        elapsed = now - last_time
+
+        speed = 0
+
+        if elapsed > 0:
+            speed = (
+                (current - last_bytes)
+                / elapsed
+            ) / (1024 * 1024)
+
+        last_time = now
+        last_bytes = current
+
+        percent = int(
+            (current / total) * 100
+        )
+
+        def update():
+
+            try:
+
+                progress_bars[idx].config(
+                    value=percent
+                )
+
+                percent_labels[idx].config(
+                    text=f"{percent}%"
+                )
+
+                speed_labels[idx].config(
+                    text=f"{speed:.2f} MB/s"
+                )
+
+                progress_labels[idx].config(
+                    text=f"Uploading: {item.filename}"
+                )
+
+            except Exception:
+                pass
+
+        ui_update(update)
+
+    for attempt in range(retries):
+        try:
+
+            logger.info(
+                f"Uploading: {item.filename} "
+                f"(attempt {attempt+1})"
+            )
+
+            if ext in PHOTO_EXTENSIONS:
+
+                msg = await app.send_photo(
+                    chat_id=chat_id,
+                    photo=file_path,
+                    caption=caption,
+                    progress=progress
+                )
+
+            elif ext in VIDEO_EXTENSIONS:
+
+                msg = await app.send_video(
+                    chat_id=chat_id,
+                    video=file_path,
+                    caption=caption,
+                    thumb=thumb,
+                    supports_streaming=True,
+                    progress=progress
+                )
+
+            else:
+
+                msg = await app.send_document(
+                    chat_id=chat_id,
+                    document=file_path,
+                    caption=caption,
+                    progress=progress
+                )
+
+            logger.info(
+                f"Uploaded: {item.filename} "
+                f"(msg_id={msg.id})"
+            )
+
+            success = True
+
+            break
+
+        except FloodWait as e:
+
+            logger.warning(
+                f"FloodWait: {e.value}s"
+            )
+
+            await asyncio.sleep(e.value)
+
+        except Exception as e:
+
+            logger.exception(
+                f"Upload failed: {item.filename}"
+            )
+
+            if attempt == retries - 1:
+
+                def fail():
+
+                    try:
+
+                        progress_labels[idx].config(
+                            text=f"Failed: {item.filename}"
+                        )
+
+                    except Exception:
+                        pass
+
+                ui_update(fail)
+
+    if success:
+
+        def complete():
+
+            try:
+
+                progress_bars[idx].config(
+                    value=100
+                )
+
+                percent_labels[idx].config(
+                    text="100%"
+                )
+
+                speed_labels[idx].config(
+                    text="Done"
+                )
+
+                progress_labels[idx].config(
+                    text=f"Completed: {item.filename}"
+                )
+
+            except Exception:
+                pass
+
+        ui_update(complete)
+
+        if thumb:
+            cleanup_temp_thumbnail(thumb)
+
+
+# =====================================================
+# UPLOAD WORKER (CONCURRENT)
+# =====================================================
+
+async def upload_worker():
+
+    global upload_running
+    upload_running = True
+
+    lock_queue_controls()
+
+    # UI must be created in main thread
+    ui_update(create_progress_window)
+    await asyncio.sleep(0.05)
+
+    try:
+        async with Client(
+            "telegram_uploader",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            workers=CLIENT_WORKERS,
+            # CRITICAL: without this, Pyrogram limits to 1 concurrent
+            # transmission, so upload_concurrency in config.json has
+            # NO effect and uploads run strictly one-by-one.
+            max_concurrent_transmissions=UPLOAD_CONCURRENCY
+        ) as app:
+
+            # =================================================
+            # SAFE CHAT RESOLUTION
+            # =================================================
+
+            resolved_chat_id = None
+
+            try:
+                # 1) Force Telegram to load peer cache
+                async for _ in app.get_dialogs():
+                    pass
+
+                # 2) Try safe resolution
+                chat = await app.get_chat(CHAT_ID)
+                resolved_chat_id = chat.id
+
+                logger.info(f"Resolved chat: {resolved_chat_id}")
+
+            except Exception:
+
+                logger.warning(
+                    "Primary chat resolution failed, trying fallback..."
+                )
+
+                try:
+                    # 3) Fallback: direct use (works for -100 IDs in most cases)
+                    resolved_chat_id = int(CHAT_ID)
+
+                    logger.info(
+                        f"Using raw chat id fallback: {resolved_chat_id}"
+                    )
+
+                except Exception as e2:
+
+                    logger.exception("Chat resolution failed completely")
+
+                    raise RuntimeError(
+                        f"Cannot access chat: {CHAT_ID}"
+                    ) from e2
+
+            # =================================================
+            # CONCURRENT UPLOADS (bounded by semaphore)
+            # =================================================
+
+            sem = asyncio.Semaphore(
+                UPLOAD_CONCURRENCY
+            )
+
+            async def guarded_upload(idx, item):
+
+                async with sem:
+                    await upload_one(
+                        app,
+                        resolved_chat_id,
+                        idx,
+                        item
+                    )
+
+            tasks = []
+
+            for idx, item in enumerate(upload_queue):
+
+                if not item.exists():
+
+                    logger.warning(
+                        f"Missing file: {item.filename}"
+                    )
+                    continue
+
+                tasks.append(
+                    asyncio.create_task(
+                        guarded_upload(idx, item)
+                    )
+                )
+
+            if tasks:
+                await asyncio.gather(*tasks)
+
+            logger.info("All uploads completed.")
+
+            def done():
+
+                messagebox.showinfo(
+                    "Done",
+                    "All uploads completed."
+                )
+
+                status_label.config(
+                    text="Completed"
+                )
+
+            ui_update(done)
+
+    except Exception as e:
+
+        logger.exception("Upload worker crashed")
+
+        ui_update(
+            lambda: messagebox.showerror(
+                "Error",
+                str(e)
+            )
+        )
+
+    finally:
+
+        upload_running = False
+
+        unlock_queue_controls()
+
+        cleanup_all_temp_thumbnails()
+
+
+# =====================================================
+# THREAD STARTER
+# =====================================================
+
+def start_upload():
+
+    if not upload_queue:
+
+        messagebox.showerror(
+            "Error",
+            "Queue is empty"
+        )
+        return
+
+    if upload_running:
+
+        messagebox.showwarning(
+            "Upload Running",
+            "Please wait..."
+        )
+        return
+
+    threading.Thread(
+        target=lambda: asyncio.run(upload_worker()),
+        daemon=True
+    ).start()
+
+    # =====================================================
+# ROOT WINDOW
+# =====================================================
+
+root = TkinterDnD.Tk()
+root.title("Telegram Sequential Uploader v2")
+root.geometry("520x780")
+root.resizable(False, False)
+
+# =====================================================
+# CAPTION
+# =====================================================
+
+tk.Label(
+    root,
+    text="Caption"
+).pack(pady=5)
+
+caption_entry = tk.Entry(
+    root,
+    width=55
+)
+caption_entry.pack(pady=5)
+
+# =====================================================
+# FILE SECTION
+# =====================================================
+
+file_label = tk.Label(
+    root,
+    text="File: None"
+)
+file_label.pack(pady=5)
+
+choose_file_button = tk.Button(
+    root,
+    text="Choose File",
+    width=25,
+    command=choose_file
+)
+choose_file_button.pack(pady=5)
+
+# =====================================================
+# THUMBNAIL SECTION
+# =====================================================
+
+thumb_label = tk.Label(
+    root,
+    text="Thumbnail: None"
+)
+thumb_label.pack(pady=5)
+
+choose_thumb_button = tk.Button(
+    root,
+    text="Choose Thumbnail",
+    width=25,
+    command=choose_thumbnail
+)
+choose_thumb_button.pack(pady=5)
+
+# =====================================================
+# QUEUE CONTROLS
+# =====================================================
+
+add_button = tk.Button(
+    root,
+    text="Add to Queue",
+    width=25,
+    command=add_to_queue
+)
+add_button.pack(pady=10)
+
+remove_button = tk.Button(
+    root,
+    text="Remove Selected",
+    width=25,
+    command=remove_selected
+)
+remove_button.pack(pady=5)
+
+upload_button = tk.Button(
+    root,
+    text=f"UPLOAD ALL ({UPLOAD_CONCURRENCY} PARALLEL)",
+    width=30,
+    bg="#2ecc71",
+    fg="white",
+    command=start_upload
+)
+upload_button.pack(pady=15)
+
+# =====================================================
+# LISTBOX + SCROLLBAR
+# =====================================================
+
+frame = tk.Frame(root)
+frame.pack(pady=10, fill=tk.BOTH, expand=True)
+
+scrollbar = tk.Scrollbar(frame)
+scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+listbox = tk.Listbox(
+    frame,
+    width=60,
+    height=15,
+    yscrollcommand=scrollbar.set
+)
+listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+scrollbar.config(command=listbox.yview)
+
+# =====================================================
+# STATUS BAR
+# =====================================================
+
+status_label = tk.Label(
+    root,
+    text="Ready",
+    bd=1,
+    relief=tk.SUNKEN,
+    anchor=tk.W
+)
+status_label.pack(side=tk.BOTTOM, fill=tk.X)
+
+# =====================================================
+# DRAG & DROP BINDING
+# =====================================================
+
+file_label.drop_target_register(DND_FILES)
+
+file_label.dnd_bind(
+    "<<Drop>>",
+    drop_file
+)
+
+# =====================================================
+# WINDOW CLOSE HANDLER
+# =====================================================
+
+root.protocol(
+    "WM_DELETE_WINDOW",
+    on_app_close
+)
+
+# =====================================================
+# START APPLICATION
+# =====================================================
+
+if __name__ == "__main__":
+
+    logger.info("Launching UI...")
+
+    root.mainloop()

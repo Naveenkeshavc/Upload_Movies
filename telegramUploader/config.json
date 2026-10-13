@@ -1,0 +1,8 @@
+{
+    "chat_id": "-1001270052926",
+    "client_workers": 8,
+    "upload_concurrency": 3,
+    "thumbnail_max_size_kb": 200,
+    "thumbnail_max_dimension": 320,
+    "retry_count": 3
+}
